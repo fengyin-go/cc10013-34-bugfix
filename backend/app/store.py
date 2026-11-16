@@ -10,13 +10,17 @@ from app.seed import SEED_ROWS
 
 
 class Store:
+    # 增量批次恢复引入的内部表：只服务于批次数据集/恢复文件/待处理清单，
+    # 不算业务模块，不能出现在运营概览的模块卡片与今日新增里。
+    HIDDEN_MODULES = {"delta_batch", "delta_recovery_file", "delta_pending"}
+
     def __init__(self) -> None:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        return sorted(name for name in self._tables if name not in self.HIDDEN_MODULES)
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])

@@ -1,9 +1,10 @@
-"""增量采集接口：维护增量游标，覆盖提交校验、启动增量、暂停增量等动作。"""
+"""增量采集接口：增量游标、批次数据集、增量待处理清单与恢复文件的导入导出。"""
 from __future__ import annotations
 
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import JSONResponse
 
 from app.schemas import ActionResult, EntryPayload, PageResult
 from app.services.delta import DeltaService
@@ -28,6 +29,114 @@ def list_entries(
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
     items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/pending", response_model=PageResult[dict])
+def list_pending() -> PageResult[dict]:
+    """增量待处理清单：装载暂停滞留与恢复结果的未完成游标。"""
+    items = service.list_pending()
+    return PageResult(items=items, total=len(items), page=1, size=len(items) or 1)
+
+
+@router.get("/batches")
+def list_batches(keyword: str | None = Query(default=None, description="按批次编号或游标编号检索")) -> dict[str, Any]:
+    """增量批次数据集：更新节点，未完成游标与确认水位都以这里为准。"""
+    items = service.list_batches(keyword=keyword)
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/batches/{batch_id}")
+def get_batch(batch_id: str) -> dict[str, Any]:
+    batch = service.get_batch(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail=f"批次 {batch_id} 不存在或已结束归档")
+    return batch
+
+
+@router.get("/recovery-files")
+def list_recovery_files(
+    keyword: str | None = Query(default=None, description="按文件编号、批次编号检索"),
+) -> dict[str, Any]:
+    """恢复文件清单：文件清单按批次核对。"""
+    items = service.list_recovery_files(keyword=keyword)
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/recovery-files/{file_id}")
+def get_recovery_file(file_id: str) -> dict[str, Any]:
+    record = service.get_recovery_file(file_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"恢复文件 {file_id} 不存在")
+    return record
+
+
+@router.get("/recovery-files/{file_id}/download")
+def download_recovery_file(file_id: str) -> JSONResponse:
+    """下载恢复文件：返回文件内容（恢复文件身份、水位参数、失败边界）。"""
+    result = service.download_recovery_file(file_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"恢复文件 {file_id} 不存在")
+    payload, filename = result
+    return JSONResponse(
+        content=payload,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/recovery-files/{file_id}/package", response_model=ActionResult)
+def package_recovery_files(file_id: str, payload: EntryPayload | None = None) -> ActionResult:
+    """打包恢复文件；可在 values.file_ids 里附带同批次其它文件一起打包。"""
+    file_ids = [file_id]
+    if payload and payload.values.get("file_ids"):
+        extra = payload.values.get("file_ids")
+        if isinstance(extra, list):
+            file_ids.extend(str(item) for item in extra)
+    result = service.package_recovery_files(file_ids)
+    if not result.get("ok"):
+        return ActionResult(ok=False, message=str(result.get("message")))
+    return ActionResult(ok=True, message=str(result.get("message")), entry=result)
+
+
+@router.post("/recovery-files/upload", response_model=ActionResult)
+def upload_recovery_file(payload: EntryPayload) -> ActionResult:
+    """上传恢复文件：登记文件身份并绑定原批次，不触发恢复。"""
+    record, message = service.upload_recovery_file(payload.values)
+    if record is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=record)
+
+
+@router.post("/recovery-files/{file_id}/import", response_model=ActionResult)
+def import_recovery_file(file_id: str) -> ActionResult:
+    """导入恢复文件并恢复增量批次数据集；重复导入同一文件只恢复原批次一次。"""
+    view, message = service.import_recovery_file(file_id)
+    if view is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=view)
+
+
+@router.post("/ingest", response_model=ActionResult)
+def ingest_cursor(payload: EntryPayload) -> ActionResult:
+    """新记录到达入口：更晚记录进入明确补偿边界，不覆盖确认水位。"""
+    values = payload.values
+    try:
+        cursor_id = int(values["cursor_id"])
+    except (KeyError, TypeError, ValueError):
+        return ActionResult(ok=False, message="缺少 cursor_id 或格式不正确")
+    cursor_code = str(values.get("cursor_code") or "").strip()
+    position = str(values.get("position") or "").strip()
+    if not cursor_code or not position:
+        return ActionResult(ok=False, message="缺少 cursor_code 或 position")
+    view, message = service.register_later_cursor(cursor_id, cursor_code, position)
+    if view is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=view)
+
+
+@router.get("/export")
+def export_entries() -> dict[str, Any]:
+    """导出增量采集清单：返回当前过滤条件下的全量数据。"""
+    return service.export_snapshot()
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -56,10 +165,3 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出增量采集清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "delta", "total": total, "items": items}
